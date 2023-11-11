@@ -1,5 +1,8 @@
 # banana_drone
 
+https://github.com/maya-undefined/banana_drone/assets/115038582/56d14cc0-3a95-40ff-9c1c-dbdfbb816d2c
+
+
 ## setup
 
 ```
@@ -62,5 +65,7 @@ colcon build --packages-select  drone_project
 source install/setup.bash
 ros2 launch drone_project drone_control_launch.py
 ```
+
+![console](https://github.com/maya-undefined/banana_drone/assets/115038582/82c30ed3-ef0a-4dc0-8de0-5dad83268d4c)
 
 You should re-run `colcon` everytime you make a change.
