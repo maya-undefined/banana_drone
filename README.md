@@ -74,10 +74,10 @@ ros2 launch drone_project drone_control_launch.py
 
 You should re-run `colcon` everytime you make a change.
 
-## fly_waypoints
+#### fly_waypoints
 
 This code will allow the drone to fly in a pre-determined set of waypoints, like on a patrol. Non-banana objects of interest could be recorded and reported when the drone finishes its patrol. GPS is not needed.
 
-## fly_hover_mavsdk
+#### fly_hover_mavsdk
 
 The drone will hover and watch for an object, with the idea to chase a detected object. By keeping the object in the center aperature of the camera, the drone can follow or track an object without complicated algoirthms or GPS.
