@@ -17,7 +17,9 @@ install gazebo
 
 ### Adding a camera
 
-the PX4 model doesn't come with a camera, so we can add one. Inside of the `PX4-Autopilot` repo apply the changes from
+![x500](https://github.com/maya-undefined/banana_drone/assets/115038582/404ca3ef-6a26-4e49-a8bf-c64c7ec188ee)
+
+the PX4 x500 model doesn't come with a camera, so we can add one. Inside of the `PX4-Autopilot` repo apply the changes from
 `changes_for_camera.xml`. 
 
 ### Darknet, ros_gz_bridge, banana_drone
@@ -38,7 +40,9 @@ cd drone_project_ws
 ```
 
 In 1 terminal run
-```ros2 run ros_gz_bridge parameter_bridge /camera@sensor_msgs/msg/Image@ignition.msgs.Image```
+```
+ros2 run ros_gz_bridge parameter_bridge /camera@sensor_msgs/msg/Image@ignition.msgs.Image
+```
 
 In another terminal run
 ```
