@@ -1,0 +1,8 @@
+launch:
+
+- node:
+    pkg: "drone_project"
+    exec: "drone_control"
+    name: "drone_control"
+    output: "screen"
+
