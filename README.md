@@ -6,7 +6,7 @@ banana drone is an autonomous drone. it is built on the ROS2 framework, uses PX4
 
 ## setup
 
-first, you need to create a new Ross to workspace. then roughly follow these steps
+first, you need to create a new Ros2 workspace. the, roughly follow these steps
 
 ```
 install px4-autopilot
