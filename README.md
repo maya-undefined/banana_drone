@@ -2,8 +2,11 @@
 
 https://github.com/maya-undefined/banana_drone/assets/115038582/56d14cc0-3a95-40ff-9c1c-dbdfbb816d2c
 
+banana drone is an autonomous drone. it is built on the ROS2 framework, uses PX4 autopilot, and uses deep learning to do object detection. Inertial guidance allows it to fly patrol via waypoints.
 
 ## setup
+
+first, you need to create a new Ross to workspace. then roughly follow these steps
 
 ```
 install px4-autopilot
