@@ -1,22 +1,16 @@
-import time
 import sys
+import math
 
-from scipy.spatial.transform import Rotation as R
-
-
-import asyncio
-
-from mavsdk import System
-from mavsdk.offboard import (OffboardError, Attitude, VelocityBodyYawspeed, PositionNedYaw)
+import numpy as np
 
 import rclpy
 from rclpy.node import Node
 from rclpy.clock import Clock
-from rclpy.qos import QoSProfile
 from rclpy.qos import qos_profile_system_default, qos_profile_sensor_data
-from rclpy.timer import Rate
 
-import numpy as np
+from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleStatus, VehicleCommand, VehicleCommandAck, VehicleLocalPosition, VehicleAttitude
+
+from sensor_msgs.msg import Image
 
 from cv_bridge import CvBridge
 import cv2
@@ -24,435 +18,306 @@ import cv2
 import darknet_ros_msgs
 from darknet_ros_msgs.msg import BoundingBoxes
 
-from px4_msgs.msg import SensorCombined, VehicleLocalPositionSetpoint, VehicleRatesSetpoint, VehicleStatus, VehicleAttitudeSetpoint, VehicleAttitude, VehicleCommand, OffboardControlMode, TrajectorySetpoint, VehicleGlobalPosition, VehicleLocalPosition
-from sensor_msgs.msg import Image
+from .commands import ArmCommand, TakeoffCommand, HoverCommand, TargetCommand, LandCommand
+from .state_machine import DroneSM
 
-from .state_estimation import StateEstimationManager
-from .control_module import ControlModule
-from .commands import CommandManager, VehicleCommandPublisher, ArmCommand, TakeoffCommand, SetpointCommand, MoveForwardCommand
-
-
-ROS_RATE = 20
 
 class DroneSystem(Node):
-    def __init__(self, mavsdk_drone=None):
+    def __init__(self):
         super().__init__('drone_control')
-        self.waypoints = []
-        self.current_pose = None
+
         self.vehicle_status = None
         self.current_command = None
-        self.control_module = None
-        self.current_attitude = None
-        self.wp = None
-        self.desired_vehicle_atttitude = None
-        self.desired_vehicle_rate_attitude = None
-        self.delta_yaw = None
+        self.trajectory_setpoint_publisher = None
+        self.vehicle_command_publisher = None
+        self.offboard_control_mode_publisher = None
+        self.local_position = None
         self.coords = None
-        self.new_yaw = None
-        self.new_pitch = None
-
-        self.taken_off = False
-        
-        # this is for flying to bananas
         self.target_bb = None
         self.found_target = False
+        self.chasing_target = False
+        self.landing = False
+        self.prev_command = []
+        self.roll = None
+        self.pitch = None
+        self.yaw = None
+        self.machine = DroneSM(initial_state="land", drone_system=self)
 
-        self.target_counter = 0
-        self.counter = 0
+        qos_profile = qos_profile_system_default
 
-        qos_profile = qos_profile_sensor_data
-
-        self.get_logger().info('Initializing...')
-
-        self.mavsdk_drone = mavsdk_drone
-        # these have to be declared here since drone_control is
-        # a ROS2 node.
-        vehicle_command_publisher = self.create_publisher(
-            VehicleCommand, 
-            '/fmu/in/vehicle_command', 
-            qos_profile)
-
-        offboard_control_mode_publisher = self.create_publisher(
-            OffboardControlMode, 
-            '/fmu/in/offboard_control_mode', 
-            qos_profile)
-
-        trajectory_setpoint_publisher = self.create_publisher(
-            TrajectorySetpoint, 
-            '/fmu/in/trajectory_setpoint', 
-            qos_profile)
-
-        vehicle_local_position_s = self.create_subscription(
-            VehicleLocalPosition, 
-            '/fmu/out/vehicle_local_position', 
-            self.localtion_cb,
-            qos_profile=qos_profile)
-
-        vehicle_status_s = self.create_subscription(
+        self.vehicle_status_s = self.create_subscription(
             VehicleStatus,
             '/fmu/out/vehicle_status',
             self.vehicle_status_cb,
             qos_profile=qos_profile
-            )
+        )
+        # Tell me how you feel, honey
+
+        self.offboard_control_mode_publisher = self.create_publisher(
+            OffboardControlMode,
+            '/fmu/in/offboard_control_mode',
+            qos_profile)
+        # I need to tell you something...
+
+        self.vehicle_command_publisher = self.create_publisher(
+            VehicleCommand, 
+            '/fmu/in/vehicle_command', 
+            qos_profile)
+        # This is what I am going to tell you...
+
+        self.command_ack_subscriber = self.create_subscription(
+                    VehicleCommandAck,
+                    '/fmu/out/vehicle_command_ack',
+                    self.command_ack_callback,
+                    qos_profile)
+
+        self.trajectory_setpoint_publisher = self.create_publisher(
+            TrajectorySetpoint,
+            '/fmu/in/trajectory_setpoint',
+            qos_profile)
+        # Go here, destination: my heart
+
+        self.vehicle_local_position_s = self.create_subscription(
+            VehicleLocalPosition,
+            '/fmu/out/vehicle_local_position',
+            self.location_cb,
+            qos_profile=qos_profile)
+        # Where am I, bb? I'm lost wthout you!
 
         self.camera_subscriber = self.create_subscription(
             Image,
+            # '/model/gz_x500_mono_cam/sensor/camera/link/camera/image',
             '/camera',
             self.camera_cb,
-            qos_profile=qos_profile)
+            qos_profile=qos_profile_sensor_data)
+        # I want to see you!
 
         self.darknet_ros = self.create_subscription(
             BoundingBoxes,
             '/darknet_ros/bounding_boxes',
             self.bounding_boxes_cb,
-            qos_profile=qos_profile
-            )
+            qos_profile=qos_profile)
+        # here i am!
 
-        self.vehicle_rates_setpoint_publisher_p = self.create_publisher(
-                VehicleRatesSetpoint,
-                '/fmu/in/vehicle_rates_setpoint', 10
-            )
-
-        self.state_manager = StateEstimationManager(
-                vehicle_local_position_s=vehicle_local_position_s,
-                logger=self.get_logger()
-            )
-
-        self.control_module = ControlModule(
-            vehicle_command_publisher=vehicle_command_publisher,
-            offboard_control_mode_publisher=offboard_control_mode_publisher,
-            trajectory_setpoint_publisher=trajectory_setpoint_publisher,
-            vehicle_rates_setpoint_publisher_p=self.vehicle_rates_setpoint_publisher_p,
-            state_manager=self.state_manager,
-            node=self,
-            logger=self.get_logger()
-        )
-
-        self.vehicle_attitude = self.create_subscription(
+        self.vehicle_attitude_subscriber = self.create_subscription(
             VehicleAttitude,
             '/fmu/out/vehicle_attitude',
-            self.vehicle_attitude_cb,
-            qos_profile=qos_profile)
-
-
-        self.vehicle_attitude_p = self.create_publisher(
-            VehicleAttitudeSetpoint,
-            '/fmu/in/vehicle_attitude_setpoint',
-            qos_profile=qos_profile
+            self.attitude_cb,
+            qos_profile=qos_profile_sensor_data
             )
+        # tell me how your sensor feels
 
-        self.vehicle_rates_p = self.create_publisher(
-            VehicleRatesSetpoint, "/fmu/in/vehicle_rates_setpoint", 10)
-
-        self.local_setpoint_p = self.create_publisher(
-            VehicleLocalPositionSetpoint, 
-            '/fmu/out/vehicle_local_position_setpoint', 10)
-
-
-        
-        self.command_manager = CommandManager(control_module=self.control_module)
-        self.trajectory_setpoint_publisher = trajectory_setpoint_publisher
         self.timer = self.create_timer(0.1, self.timer_cb)
+        # I think of you 10 times a second, Evelyn.
 
+
+    def command_ack_callback(self, msg):
+        # Log the acknowledgment result
+        self.get_logger().info(
+            f'VehicleCommandAck {msg.command} acknowledged with result {msg.result} (from_external={msg.from_external})'
+        )
+        if msg.command == VehicleCommand.VEHICLE_CMD_NAV_LAND and msg.result == 0: # Land 
+            self.landing = True
+            # stuff like this should go into a lookup based on key per command
+            # that is, without explicitly coding each and every command
+            # let's instead have a way for commands to register to listen
+            # based on a key like VEHICLE_CMD_NAV_LAND forr the LandCommand
+            # and when the msg gets in here from px4 land, we notify the command
+            # that was listening/registered on the VEHICLE_CMD_NAV_LAND 'key'
+            # 
+            # it can also be used to pass data between drone and commands
+            # in fact, using this to abstract vehicle components away, such as
+            # yaw/pitch/roll (since not all drones will have these), this allows
+            # an abstract way to interface Commands() to DroneControl() parts.
+
+        if msg.result == 0:  # Success
+            self.get_logger().info('\tCommand executed successfully')
+        elif msg.result == 1:  # Failure
+            self.get_logger().warning('\tCommand failed')
+        elif msg.result == 2:  # In progress
+            self.get_logger().info('\tCommand in progress')
+
+    def on_takeoff(self):
+        # Issue the Takeoff command
+        pass
+
+    def bounding_boxes_cb(self, msg=None):
+        # self.get_logger().info('BB Called!')
+
+        for bb in msg.bounding_boxes:
+            # if bb.class_id == 'banana':
+            self.found_target = True
+            # self.current_command_state = CommandState.TARGET
+            self.target_bb = bb
+            self._calculate_coords()
+
+    def _calculate_coords(self):
+        if self.target_bb == None:
+            return None
+        bb = self.target_bb
+        image_w = 640*2
+        image_h = 480*2
+        box_x = (bb.xmax - bb.xmin) / 2 + bb.xmin
+        box_y = (bb.ymax - bb.ymin) / 2 + bb.ymin
+        x_width = math.fabs(bb.xmax - bb.xmin)
+        y_height = math.fabs(bb.ymax - bb.ymin)
+        self.coords = {
+            'x': box_x, 'y': box_y, 
+            'x_width': x_width, 'y_height': y_height
+            }
+
+        # error_x = box_x - ((image_w / 2) - 1)
+        # error_y = ((image_h / 2) - 1) - box_y
+        # gain = 1
+        # delta_east = gain * error_x
+        # delta_north = gain * error_y
+        # new_east = 
+
+        # s = "box_x: {}, box_y: {}, error_x: {}, error_y: {}, new_east: {}, new_north: {}, delta_east: {}, delta_north: {} ".format(box_x, 
+        #     box_y, error_x, error_y, new_east, new_north, delta_east, delta_north)
+        # self.get_logger().info(s)
+
+
+    def camera_cb(self, msg=None):
+        # TODO: There needs to be a way to handle multiple cameras
+        # This camera call back should be a 'Widget' or some extension, distinct
+        # from the 'Command'
+        # A possible apparatus would be 
+        '''
+        class Widget():
+            def init(self):
+                ...
+            def register_my_subscriptions(self):
+                register to things like '/camera' or '/darknet_ros/bounding_boxes'
+
+            def register_my_callbacks(self):
+                register my functions (like this very function) to run as a cb via
+                ros2 subscriptions
+            def register_my_publishers(self):
+                publish my new coords{} object and notify any listeners, possibly in my
+                funky KV idea
+
+        '''
+        bridge = CvBridge()
+        cv_image = bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        (rows,cols,channels) = cv_image.shape
+        # self.get_logger().info(f'{rows}, {cols}')
+        # print("camera!")
+        self._calculate_coords()
+        if self.coords != None:
+            cv2.circle(cv_image, (int(self.coords['x']), int(self.coords['y']) ), 10, 255)
+
+        cv2.line(cv_image, (0, rows//2), (cols, rows//2), (255, 0, 0), 1)
+        cv2.line(cv_image, (cols//2, 0), (cols//2, rows), (255, 0, 0), 1) # vertical line
+
+        cv2.imshow("ROS2 Camera View", cv_image)
+        cv2.waitKey(1)
 
     def vehicle_status_cb(self, msg=None):
         self.vehicle_status = msg
 
-    def vehicle_attitude_cb(self, msg):
-        self.current_attitude = msg.q
+    def location_cb(self, msg=None):
+        self.local_position = msg
+        msg_size = sys.getsizeof(msg)
+        '''
+        self.get_logger().info(f'VehicleLocalPosition size: {msg_size} bytes')
+        # Print out some key fields to verify content
+        self.get_logger().info(f'\tTimestamp: {msg.timestamp}')
+        self.get_logger().info(f'\tPosition: x={msg.x}, y={msg.y}, z={msg.z}')
+        '''
 
-    def bounding_boxes_cb(self, msg=None):
-        self.found_target = False
-        self.target_bb = None
-        for bb in msg.bounding_boxes:
-            if bb.class_id == 'banana':
-                self.found_target = True
-                self.target_bb = bb
+    def publish_vehicle_command(self, command, param1=0.0, param2=0.0):
+        msg = VehicleCommand()
+        msg.param1 = param1
+        msg.param2 = param2
+        msg.command = command  # command ID
+        msg.target_system = 1  # system which should execute the command
+        msg.target_component = 1  # component which should execute the command, 0 for all components
+        msg.source_system = 1  # system sending the command
+        msg.source_component = 1  # component sending the command
+        msg.from_external = True
+        msg.timestamp = int(Clock().now().nanoseconds / 1000) # time in microseconds
+        self.vehicle_command_publisher.publish(msg)
 
-    def camera_cb(self, msg=None):
-        bridge = CvBridge()
-        cv_image = bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-        (rows,cols,channels) = cv_image.shape
+    def offboard_control(self):
+        msg = OffboardControlMode()
+        msg.position = True
+        msg.velocity = True
+        msg.acceleration = True
+        msg.timestamp = int(Clock().now().nanoseconds / 1000) # time in microseconds
+        self.offboard_control_mode_publisher.publish(msg)
 
-        if self.coords != None:
-            cv2.circle(cv_image, (int(self.coords['x']), int(self.coords['y']) ), 10, 255)
-
-        cv2.line(cv_image, (0, 240), (640, 240), (255, 0, 0), 1)
-        cv2.line(cv_image, (320, 0), (320, 480), (255, 0, 0), 1)
-
-        cv2.imshow("ROS2 Camera View", cv_image)
-        cv2.waitKey(1)
-        pass
-
-    def localtion_cb(self, msg):
-        self.state_manager.update(msg)  
-        self.current_pose = msg
-
-
-    def arm(self):
-        self.run_command(ArmCommand(self.control_module))
-
-
-    def takeoff(self):
-        while self.vehicle_status == None or self.vehicle_status.arming_state != 2:
-            rclpy.spin_once(self)
-
-        self.wp = [0,0,-2.5]
-
-        self.run_command( TakeoffCommand(self.control_module) )
-        self.taken_off = True
-
-    def run_command(self, command=None, target=100):
-        if command is None:
-            return
+    def run_command(self, command):
+        if self.current_command:
+            self.prev_command.append(self.current_command)
+            self.current_command.canceled = True
 
         self.current_command = command
-        self.target_counter = self.counter + target
 
-    def clear_command(self):
-        self.current_command = None
+    def quaternion_to_euler(self, q):
+        """Convert a quaternion into Euler angles (roll, pitch, yaw)."""
+        w, x, y, z = q
 
-    async def _follow(self, delta_east, delta_north, drone):
-        forward = 5.0
-        east = 0.0
-        down = 0.0
-        yawspeed = 0.0
+        # Roll (x-axis rotation)
+        sinr_cosp = 2 * (w * x + y * z)
+        cosr_cosp = 1 - 2 * (x * x + y * y)
+        roll = math.atan2(sinr_cosp, cosr_cosp)
 
-        if delta_east < 0:
-            yawspeed = -30
-            east = -2
-        else:
-            # we turn right
-            yawspeed = 30
-            east = 2
+        # Pitch (y-axis rotation)
+        sinp = 2 * (w * y - z * x)
+        pitch = math.asin(sinp) if abs(sinp) <= 1 else math.copysign(math.pi / 2, sinp)
 
-        if delta_north < 0:
-            down = -1
-        else:
-            down = 1
+        # Yaw (z-axis rotation)
+        siny_cosp = 2 * (w * z + x * y)
+        cosy_cosp = 1 - 2 * (y * y + z * z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
 
-        await drone.offboard.set_velocity_body(
-            VelocityBodyYawspeed(forward, east, down, yawspeed)
-        )
-        await asyncio.sleep(4)
+        return roll, pitch, yaw
 
-        return (forward, east, down, yawspeed)        
+    def attitude_cb(self, msg):
+        self.vehicle_attitude = msg
+        q = np.array([msg.q[0], msg.q[1], msg.q[2], msg.q[3]])
+        roll, pitch, yaw = self.quaternion_to_euler(q)
 
+        # Convert radians to degrees
+        roll_deg = math.degrees(roll)
+        pitch_deg = math.degrees(pitch)
+        yaw_deg = math.degrees(yaw)
+        # self.get_logger().info(f"Roll: {roll_deg:.2f}°, Pitch: {pitch_deg:.2f}°, Yaw: {yaw_deg:.2f}°")
+        self.roll, self.pitch, self.yaw = roll, pitch, yaw
 
     def timer_cb(self):
-        self.counter += 1
+        '''
+        if image/drone is ready: 
 
-        if self.current_command is None:
-            return
-        if self.control_module is None:
-            return
+            analyze_image()
 
-        if self.desired_vehicle_atttitude != None:
-            self.desired_vehicle_atttitude = None
+            if state == found:
+                move_to_balloon
+            else:
+                patrol()
+
         else:
-            self.control_module.offboard_control()
-            # this has to be done every spin, as a heartbeat
+            execute current command
+        '''
+
+        self.offboard_control()
+
+        if self.found_target and not self.chasing_target:
+            self.get_logger().info('found_target')
+            # self.get_logger().info("Found a Target")
+            # pre-empt current command by just deleting it
+            target_command = TargetCommand(self)
+            # target_command = LandCommand(self)
+            self.run_command(target_command)
+            self.chasing_target = True
+        # self.get_logger().info(" %s - %s " % (self.current_command, self.current_command.done()))
+
+        if self.current_command and not self.current_command.done():
+            # if not self.current_command.executed:
             self.current_command.execute()
-
-        self.counter += 1
-
-
-    def check_waypoint_reached(self, pos_tol=0.3):
-        if self.current_pose is None or self.wp is None:
-            return 0
-
-        wp = self.wp
-
-        deltax = np.abs(self.current_pose.x - wp[0])
-        deltay = np.abs(self.current_pose.y - wp[1])
-        deltaz = np.abs(self.current_pose.z - wp[2])
-        dmag = np.sqrt(
-                np.power(deltax, 2) +
-                np.power(deltay, 2) +
-                np.power(deltaz, 2)
-            )
-
-        # s = "%s %s %s %s %s" % (wp[0], deltax, deltay, deltaz, dmag)
-        # self.get_logger().info(str(s))
-        if dmag < pos_tol:
-            # self.get_logger().info("we got near!")
-            return 1
         else:
-            return 0
-
-    def set_next_destination(self):
-        if len(self.waypoints) == 0:
-            return 
-            # raise Exception("waypoints are out")
-
-        wp =  self.waypoints[-1]
-        # self.get_logger().info("Going to " + str(wp))
-
-        sp = SetpointCommand(
-            control_module=self.control_module,
-            x=wp[0], y=wp[1], z=wp[2]
-        )
-
-        self.run_command(sp, 1048576)
-
-        msg = TrajectorySetpoint()
-        msg.position = [wp[0], wp[1], wp[2]]
-        msg.velocity = [10.0, 10.0, 10.0]
-        msg.timestamp = int(Clock().now().nanoseconds / 1000) # time in microseconds
-        self.control_module.trajectory_setpoint_publisher.publish(msg)
-        self.waypoints.pop()
-        self.wp = wp
-
-
-    def _q_to_e(self, current_orientation):
-        # Convert quaternion to Euler angles
-        r = R.from_quat(current_orientation)
-        current_angles = r.as_euler('xyz', degrees=False)
-        current_roll, current_pitch, current_yaw = current_angles
-        return (current_roll, current_pitch, current_yaw)
-
-    def _e_to_q(self, current_orientation):
-        current_roll, new_pitch, new_yaw = current_orientation
-        new_r = R.from_euler('xyz', [current_roll, new_pitch, new_yaw], degrees=False)
-        new_orientation = new_r.as_quat()
-        return new_orientation
-
-    def _e_to_ned(self, current_attitude, body_direction):
-        r = R.from_quat(current_attitude)
-        ned_direction = r.apply(body_direction)
-        return ned_direction
-
-    def move_forward(self):
-        msg = VehicleRatesSetpoint()
-        # msg.roll = 0.0  # No roll rate
-        # msg.pitch = 0.0  # No pitch rate
-        # msg.yaw = 0.0  # No yaw rate
-        msg.thrust_body[0] = 1.0  # Half thrust forward
-        msg.thrust_body[1] = 0.0  # No sideways thrust
-        msg.thrust_body[2] = 0.0  # No upward thrust
-        msg.timestamp = int(Clock().now().nanoseconds / 1000)  # time in microseconds
-        self.vehicle_rates_setpoint_publisher_p.publish(msg)
-
-    async def fly_to_label(self):
-        if not self.target_bb:
-            return
-        bb = self.target_bb
-        if self.current_attitude is None:
-            return
-        current_attitude = self.current_attitude
-        current_angles = self._q_to_e(current_attitude)
-
-        if bb is None:
-            return
-        image_w = 640
-        image_h = 480
-        # see PX4/Tools/simulation/gz/worlds/default2.sdf
-
-        gain = 0.05
-        current_roll, current_pitch, current_yaw = current_angles
-        box_x = (bb.xmax - bb.xmin) / 2 + bb.xmin
-        box_y = (bb.ymax - bb.ymin) / 2 + bb.ymin
-        error_x = box_x - ((image_w / 2) - 1)
-        error_y = ((image_h / 2) - 1) - box_y
-        delta_east = gain * error_x
-        delta_north = gain * error_y
-
-        new_east = box_x + delta_east
-        new_north = box_y + delta_north
-
-        s = "box_x: {}, box_y: {}, error_x: {}, error_y: {}, new_east: {}, new_north: {}, delta_east: {}, delta_north: {} ".format(box_x, 
-            box_y, error_x, error_y, new_east, new_north, delta_east, delta_north)
-        self.get_logger().info(s)
-
-        self.coords = {'x': box_x, 'y': box_y}
-
-        if self.mavsdk_drone != None:
-            (forward, east, down, yawspeed) = await self._follow(delta_east, delta_north, self.mavsdk_drone)
-            s = "forward: {}, east: {}, down: {}, yawspeed: {} ".format(forward, east, down, yawspeed)
-            self.get_logger().info(s)
-
-
-async def print_status_text(drone):
-    try:
-        async for status_text in drone.telemetry.status_text():
-            print(f"Status: {status_text.type}: {status_text.text}")
-    except asyncio.CancelledError:
-        return
-
-def fly_waypoints(drone_system):
-
-    drone_system.waypoints.append([0, 0, -10, 180])
-    drone_system.waypoints.append([0, 50, -10, 90])
-    drone_system.waypoints.append([50, 50, -10, 0])
-    drone_system.waypoints.append([50, 0, -10, -90])
-    drone_system.waypoints.append([0, 0, -10, 0])
-    # dont duplicate these!
-
-    counter = 0
-
-    drone_system.arm()
-    while rclpy.ok():
-        rclpy.spin_once(drone_system)
-        if drone_system.target_counter == drone_system.counter:
-            break
-
-    drone_system.run_command( TakeoffCommand(drone_system.control_module) )
-    while rclpy.ok():
-        rclpy.spin_once(drone_system)
-        if drone_system.target_counter == drone_system.counter:
-            break
-
-    print(drone_system.waypoints)
-
-    drone_system.set_next_destination()
-    while rclpy.ok():
-        counter +=1 
-        rclpy.spin_once(drone_system)
-        # print(str(drone_system.check_waypoint_reached()), drone_system.waypoints)
-        if (drone_system.check_waypoint_reached() == 1):
-            if len(drone_system.waypoints) == 0:
-                break
-            drone_system.set_next_destination()
-
-
-
-    # bleep bloop
-    drone_system.destroy_node()
-    rclpy.shutdown()
-
-async def fly_hover_mavsdk():
-    mavsdk_drone = System()
-    await mavsdk_drone.connect(system_address="udp://:14540")
-    drone_system = DroneSystem(mavsdk_drone=mavsdk_drone)
-
-    drone_system.waypoints.append([0, 0, -2.5, 0])
-    # need at least one or the drone will never take off
-
-    counter = 0
-
-    drone_system.arm()
-    while rclpy.ok():
-        rclpy.spin_once(drone_system)
-        if drone_system.target_counter == drone_system.counter:
-            break
-
-    await mavsdk_drone.offboard.set_position_ned(
-        PositionNedYaw(0, 0, 0, 0))
-
-    await mavsdk_drone.offboard.set_position_ned(
-        PositionNedYaw(0, 0, -2.5, 0))
-    await asyncio.sleep(4)
-    print(drone_system.waypoints)
-
-    drone_system.set_next_destination()
-    while rclpy.ok():
-        counter +=1 
-        rclpy.spin_once(drone_system)
-
-        await drone_system.fly_to_label() 
-
-        if drone_system.target_bb != None:
-            rclpy.spin_once(drone_system)
+            self.current_command = None
 
 
 
@@ -460,9 +325,31 @@ def main(args=None):
     rclpy.init(args=args)
     drone_system = DroneSystem()
 
-    # fly_waypoints(drone_system)
+    arm_cmd = ArmCommand(drone_system)
+    drone_system.run_command(arm_cmd)
 
-    asyncio.run( fly_hover_mavsdk() )
+    while rclpy.ok():
+        rclpy.spin_once(drone_system)
+        if arm_cmd.done():
+            break
+
+    takeoff_cmd = TakeoffCommand(drone_system)
+    drone_system.run_command(takeoff_cmd)
+
+    while rclpy.ok():
+        rclpy.spin_once(drone_system)
+        if takeoff_cmd.done():
+            break
+
+    hover_cmd = HoverCommand(drone_system)
+    drone_system.run_command(hover_cmd)
+    while rclpy.ok():
+        rclpy.spin_once(drone_system)
+        # if hover_cmd.done():
+        #     break
+
+    drone_system.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
